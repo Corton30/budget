@@ -15,6 +15,8 @@
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" type="image/png" href="icon-192.png">
 <link rel="manifest" href="manifest.webmanifest">
+<link rel="preconnect" href="https://script.google.com" crossorigin="anonymous">
+<link rel="preconnect" href="https://script.googleusercontent.com" crossorigin="anonymous">
 <title>Budget</title>
 <style>
 :root{
@@ -212,6 +214,10 @@ body.setup .tabs,body.setup .month,body.setup .sync{display:none}
 .linkbtn{display:block;margin:22px auto 0;min-height:44px;padding:0 14px;border:0;background:transparent;color:var(--label2);font-size:14px;text-decoration:underline}
 .offline{display:none;text-align:center;font-size:13px;font-weight:600;color:var(--orange);padding:6px 0 0}
 body.is-offline .offline{display:block}
+.ttl{min-width:0}
+.upd{font-size:12px;font-weight:500;color:var(--label2);height:15px;line-height:15px;margin-top:1px;transition:opacity .5s;white-space:nowrap}
+.upd.hide{opacity:0}.upd.ok{color:var(--green)}
+.sync{display:none!important}
 @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -219,7 +225,7 @@ body.is-offline .offline{display:block}
 
 <header class="top">
   <div class="top-row">
-    <h1 id="title">Budget</h1>
+    <div class="ttl"><h1 id="title">Budget</h1><div class="upd hide" id="upd" aria-live="polite"></div></div>
     <div style="display:flex;align-items:center;gap:10px">
       <div class="sync" id="sync" aria-hidden="true"></div>
       <div class="month" role="group" aria-label="Mois affiché">
@@ -393,6 +399,13 @@ function api(conf, body, retries){
   return run();
 }
 function setOffline(on){ document.body.classList.toggle('is-offline',!!on); }
+var updT=null;
+function setUpd(state){
+  var u=$('upd'); clearTimeout(updT); u.classList.remove('ok');
+  if(state==='busy'){ u.textContent='Actualisation…'; u.classList.remove('hide'); }
+  else if(state==='ok'){ u.textContent='À jour ✓'; u.classList.add('ok'); u.classList.remove('hide'); updT=setTimeout(function(){ u.classList.add('hide'); },1800); }
+  else u.classList.add('hide');
+}
 
 /* ---------- connexion ---------- */
 function parseLink(raw){
@@ -497,17 +510,20 @@ function computeDashboard(sy, ym){
 function recompute(){ if(S.sync){ S.data=computeDashboard(S.sync,S.ym); S.loadError=null; } renderAll(); }
 function applySync(sy){
   if(!sy || !sy.tx) return;
-  S.sync=sy; S.syncedAt=Date.now();
+  S.sync=sy; S.syncedAt=Date.now(); store('syncedAt',String(S.syncedAt));
   try{ localStorage.setItem('budget:sync',JSON.stringify(sy)); }catch(e){}
   recompute();
 }
-function load(){
+function load(force){
   if(!CONF){ needSetup(); return; }
   if(!S.sync){ try{ var c=JSON.parse(localStorage.getItem('budget:sync')||'null'); if(c && c.tx) S.sync=c; }catch(e){} }
+  if(!S.syncedAt){ S.syncedAt=+(store('syncedAt')||0); }
   recompute();                                            // affichage immédiat depuis la dernière copie
-  var my=++S.seq; S.loading=true; setSync(true);
-  call('getSync').then(function(sy){ if(my===S.seq) applySync(sy); })
-    .catch(function(e){ if(my!==S.seq) return; S.loadError=e.message; if(S.data) toast(e.message,true); renderAll(); })
+  if(!force && S.sync && Date.now()-S.syncedAt < 30000) return;   // synchronisé il y a moins de 30 s : inutile
+  if(S.loading) return;
+  var my=++S.seq; S.loading=true; setSync(true); setUpd('busy');
+  call('getSync').then(function(sy){ if(my===S.seq){ applySync(sy); setUpd('ok'); } })
+    .catch(function(e){ if(my!==S.seq) return; setUpd(''); S.loadError=e.message; if(S.data) toast(e.message,true); renderAll(); })
     .then(function(){ if(my===S.seq){ S.loading=false; setSync(false); } });
 }
 function changeMonth(d){
@@ -523,7 +539,7 @@ function renderAll(){
 function monthLabelLocal(ym){ try{ var s=new Date(Date.UTC(+ym.slice(0,4),+ym.slice(5,7)-1,1)).toLocaleDateString('fr-FR',{month:'long',year:'numeric',timeZone:'UTC'}); return s.charAt(0).toUpperCase()+s.slice(1); }catch(e){ return ym; } }
 
 function errorBox(host){
-  var b=el('div','card err-box'); b.appendChild(el('p',null,S.loadError)); var r=el('button','retry','Réessayer'); r.type='button'; r.onclick=load; b.appendChild(r); host.appendChild(b);
+  var b=el('div','card err-box'); b.appendChild(el('p',null,S.loadError)); var r=el('button','retry','Réessayer'); r.type='button'; r.onclick=function(){ load(true); }; b.appendChild(r); host.appendChild(b);
 }
 function skeleton(host){
   var g=el('div','kpis'); [118,96,96,96].forEach(function(h,i){ var s=el('div','sk'); s.style.height=h+'px'; if(i===0) s.style.gridColumn='1/-1'; g.appendChild(s); });
@@ -766,7 +782,7 @@ $('backdrop').addEventListener('click',function(){ if(!S.busy) closeSheet(); });
 document.addEventListener('keydown',function(e){ if(e.key==='Escape' && S.sel && !S.busy) closeSheet(); });
 document.addEventListener('visibilitychange',function(){ if(document.visibilityState==='visible' && !S.busy && CONF) load(); });
 window.addEventListener('pageshow',function(e){ if(e.persisted && !S.busy && CONF) load(); });
-window.addEventListener('online',function(){ setOffline(false); if(!S.busy && CONF) load(); });
+window.addEventListener('online',function(){ setOffline(false); if(!S.busy && CONF) load(true); });
 window.addEventListener('offline',function(){ setOffline(true); });
 $('setupBtn').addEventListener('click',trySetup);
 $('setupLink').addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); trySetup(); } });
