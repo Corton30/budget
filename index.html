@@ -319,7 +319,7 @@ var TYPES = { EXP:{label:'Ajouter la dépense', tab:'Dépense'}, INC:{label:'Ajo
 var S = {
   view:'home', ym:currentYm(), data:null, seq:0, loading:false, loadError:null,
   f:{ type:'EXP', cat:'', acct:'', src:'', from:'', to:'', status:'Réel' },
-  busy:false, reqId:null, showAllCats:false, sel:null, armed:false
+  busy:false, reqId:null, showAllCats:false, sel:null, armed:false, sync:null, syncedAt:0
 };
 
 /* ---------- utilitaires ---------- */
@@ -349,10 +349,10 @@ function parseAmt(s){
 
 /* ---------- appels serveur : requêtes HTTP indépendantes (aucune session à expirer) ---------- */
 var ACTIONS = {
-  getDashboard:      function(ym){ return { action:'dashboard', ym:ym }; },
-  addTransaction:    function(p,id){ return { action:'add', payload:p, requestId:id }; },
-  updateTransaction: function(r,c,ym){ return { action:'update', ref:r, changes:c, ym:ym }; },
-  deleteTransaction: function(r,ym){ return { action:'delete', ref:r, ym:ym }; }
+  getSync:           function(){ return { action:'sync' }; },
+  addTransaction:    function(p,id){ return { action:'add', payload:p, requestId:id, want:'sync' }; },
+  updateTransaction: function(r,c,ym){ return { action:'update', ref:r, changes:c, ym:ym, want:'sync' }; },
+  deleteTransaction: function(r,ym){ return { action:'delete', ref:r, ym:ym, want:'sync' }; }
 };
 function call(name){
   var body=ACTIONS[name].apply(null,[].slice.call(arguments,1));
@@ -404,7 +404,7 @@ function parseLink(raw){
   return { url:u.origin+u.pathname, k:k };
 }
 function needSetup(msg){
-  CONF=null; saveConf(null);
+  CONF=null; saveConf(null); S.sync=null; S.data=null; try{ localStorage.removeItem('budget:sync'); }catch(e){}
   document.body.classList.add('setup');
   ['home','add','hist'].forEach(function(x){ $('v-'+x).classList.remove('on'); });
   $('v-setup').classList.add('on'); $('title').textContent='Budget';
@@ -415,11 +415,11 @@ function trySetup(){
   var c=parseLink($('setupLink').value);
   if(!c){ $('setupErr').textContent='Lien invalide : il doit commencer par https://script.google.com/… et se terminer par /exec?k=ta-clé.'; return; }
   btn.disabled=true; btn.classList.add('busy'); $('setupErr').textContent='';
-  api(c,{action:'dashboard', ym:S.ym},1).then(function(d){
+  api(c,{action:'sync'},1).then(function(sy){
     CONF=c; saveConf(c);
     document.body.classList.remove('setup'); $('v-setup').classList.remove('on');
     $('setupLink').value='';
-    show('home'); applyData(d); toast('Connecté');
+    show('home'); applySync(sy); toast('Connecté');
   }).catch(function(e){ $('setupErr').textContent=e.message; })
     .then(function(){ btn.disabled=false; btn.classList.remove('busy'); });
 }
@@ -434,22 +434,85 @@ function toast(msg,isErr){
 
 /* ---------- chargement ---------- */
 function setSync(on){ $('sync').classList.toggle('on',!!on); }
-function applyData(d){
-  if(!d || d.ym!==S.ym) return;
-  S.data=d; S.loadError=null;
-  store('dash:'+d.ym, JSON.stringify(d));
-  renderAll();
+/* ---------- données : une synchro complète, calcul des mois sur le téléphone ---------- */
+var MONTHS_FR=['janvier','février','mars','avril','mai','juin','juillet','août','septembre','octobre','novembre','décembre'];
+function normTxt(x){ return String(x==null?'':x).normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/\s+/g,' ').trim(); }
+function r2(n){ return Math.round(n*100)/100; }
+function ymOfSerial(sr){ var d=new Date((sr-25569)*86400000); return d.getUTCFullYear()+'-'+('0'+(d.getUTCMonth()+1)).slice(-2); }
+
+/* Même calcul que dashboard_() côté serveur (Code.gs). */
+function computeDashboard(sy, ym){
+  var today=todayIso();
+  var sav=(sy.savings||[]).map(normTxt), isSav=function(a){ return sav.indexOf(normTxt(a))>=0; };
+  var acc={}, accOrder=[];
+  sy.accounts.forEach(function(a){ acc[a.name]={ name:a.name, real:a.initial, projected:a.initial, savings:isSav(a.name) }; accOrder.push(a.name); });
+  var m={ income:0, expenses:0, incomePlanned:0, expensesPlanned:0, saved:0 };
+  var cat={}, catOrder=[];
+  sy.categories.forEach(function(c){ cat[c.name]={ name:c.name, budget:c.budget, spent:0, planned:0 }; catOrder.push(c.name); });
+  var uncategorized=0, history=[];
+  sy.tx.forEach(function(x){
+    var t={ sheet:x[0], row:x[1], serial:x[2]||null, amount:x[3], label:x[4], category:x[5], account:x[6], from:x[7], to:x[8], planned:!!x[9], note:x[10] };
+    t.ym = t.serial ? ymOfSerial(t.serial) : null;
+    if(t.sheet==='EXP' && acc[t.account]){ acc[t.account].projected-=t.amount; if(!t.planned) acc[t.account].real-=t.amount; }
+    if(t.sheet==='INC' && acc[t.account]){ acc[t.account].projected+=t.amount; if(!t.planned) acc[t.account].real+=t.amount; }
+    if(t.sheet==='TRF'){
+      if(acc[t.from]){ acc[t.from].real-=t.amount; acc[t.from].projected-=t.amount; }
+      if(acc[t.to]){ acc[t.to].real+=t.amount; acc[t.to].projected+=t.amount; }
+    }
+    if(t.ym!==ym) return;
+    if(t.sheet==='EXP'){
+      if(t.planned) m.expensesPlanned+=t.amount; else m.expenses+=t.amount;
+      if(cat[t.category]){ if(t.planned) cat[t.category].planned+=t.amount; else cat[t.category].spent+=t.amount; }
+      else if(!t.planned) uncategorized+=t.amount;
+    } else if(t.sheet==='INC'){
+      if(t.planned) m.incomePlanned+=t.amount; else m.income+=t.amount;
+    } else {
+      if(isSav(t.to) && !isSav(t.from)) m.saved+=t.amount;
+      if(isSav(t.from) && !isSav(t.to)) m.saved-=t.amount;
+    }
+    history.push(t);
+  });
+  history.sort(function(a,b){ return (b.serial||0)-(a.serial||0) || b.row-a.row; });
+  var accounts=accOrder.map(function(k){ var a=acc[k]; return { name:a.name, real:r2(a.real), projected:r2(a.projected), savings:a.savings }; });
+  var categories=catOrder.map(function(k){ var c=cat[k]; return { name:c.name, budget:r2(c.budget), spent:r2(c.spent), planned:r2(c.planned) }; });
+  if(uncategorized>0) categories.push({ name:'Sans catégorie', budget:0, spent:r2(uncategorized), planned:0, warning:true });
+  var yy=+ym.slice(0,4), mm=+ym.slice(5,7);
+  var daysInMonth=new Date(Date.UTC(yy,mm,0)).getUTCDate(), curYm=today.slice(0,7);
+  return {
+    ym:ym, label:MONTHS_FR[mm-1].charAt(0).toUpperCase()+MONTHS_FR[mm-1].slice(1)+' '+yy, today:today,
+    daysInMonth:daysInMonth, daysElapsed: ym<curYm ? daysInMonth : (ym>curYm ? 0 : +today.slice(8,10)),
+    lists:{ categories:sy.categories.map(function(c){ return c.name; }), accounts:sy.accounts.map(function(a){ return a.name; }), sources:sy.sources },
+    totals:{
+      balance:r2(accounts.reduce(function(a,b){ return a+b.real; },0)),
+      balanceProjected:r2(accounts.reduce(function(a,b){ return a+b.projected; },0)),
+      income:r2(m.income), expenses:r2(m.expenses), incomePlanned:r2(m.incomePlanned), expensesPlanned:r2(m.expensesPlanned),
+      saved:r2(m.saved), savingsRate: m.income>0 ? Math.round((m.income-m.expenses)/m.income*1000)/1000 : null,
+      budget:r2(sy.categories.reduce(function(a,c){ return a+c.budget; },0))
+    },
+    accounts:accounts, categories:categories,
+    history:history.slice(0,60).map(function(t){ return { sheet:t.sheet,row:t.row,serial:t.serial,amount:t.amount,label:t.label,category:t.category||'',account:t.account||'',from:t.from||'',to:t.to||'',planned:t.planned,note:t.note||'' }; }),
+    historyTotal:history.length
+  };
+}
+function recompute(){ if(S.sync){ S.data=computeDashboard(S.sync,S.ym); S.loadError=null; } renderAll(); }
+function applySync(sy){
+  if(!sy || !sy.tx) return;
+  S.sync=sy; S.syncedAt=Date.now();
+  try{ localStorage.setItem('budget:sync',JSON.stringify(sy)); }catch(e){}
+  recompute();
 }
 function load(){
   if(!CONF){ needSetup(); return; }
+  if(!S.sync){ try{ var c=JSON.parse(localStorage.getItem('budget:sync')||'null'); if(c && c.tx) S.sync=c; }catch(e){} }
+  recompute();                                            // affichage immédiat depuis la dernière copie
   var my=++S.seq; S.loading=true; setSync(true);
-  if(!S.data || S.data.ym!==S.ym){
-    var c=store('dash:'+S.ym); if(c){ try{ S.data=JSON.parse(c); }catch(e){ S.data=null; } } else S.data=null;
-    renderAll();
-  }
-  call('getDashboard', S.ym).then(function(d){ if(my===S.seq) applyData(d); })
+  call('getSync').then(function(sy){ if(my===S.seq) applySync(sy); })
     .catch(function(e){ if(my!==S.seq) return; S.loadError=e.message; if(S.data) toast(e.message,true); renderAll(); })
     .then(function(){ if(my===S.seq){ S.loading=false; setSync(false); } });
+}
+function changeMonth(d){
+  S.ym=shiftYm(S.ym,d); recompute();                      // instantané, sans réseau
+  if(!S.loading && (!S.syncedAt || Date.now()-S.syncedAt>120000)) load();   // rafraîchit en fond si > 2 min
 }
 
 /* ---------- rendu ---------- */
@@ -607,7 +670,7 @@ function submit(){
     S.reqId=null;
     $('amt').value=''; $('desc').value=''; $('note').value=''; f.cat=''; f.src='';
     toast((res.entry.duplicate?'Déjà enregistré · ':'Ajouté · ')+eur(res.entry.amount)+(res.entry.label?' · '+res.entry.label:''));
-    applyData(res.dashboard);
+    applySync(res.sync);
   }).catch(function(e){
     toast(e.message,true);                              // les champs restent remplis pour réessayer
   }).then(function(){ S.busy=false; renderForm(); });
@@ -674,7 +737,7 @@ function mutate(fn,args,okMsg){
   S.busy=true;
   Array.prototype.forEach.call($('sheet').querySelectorAll('button,select'),function(x){ x.disabled=true; });
   setSync(true);
-  call.apply(null,[fn].concat(args)).then(function(res){ closeSheet(); toast(okMsg); applyData(res.dashboard); })
+  call.apply(null,[fn].concat(args)).then(function(res){ closeSheet(); toast(okMsg); applySync(res.sync); })
     .catch(function(e){ toast(e.message,true); Array.prototype.forEach.call($('sheet').querySelectorAll('button,select'),function(x){ x.disabled=false; }); })
     .then(function(){ S.busy=false; setSync(false); renderForm(); });
 }
@@ -697,8 +760,8 @@ $('submit').addEventListener('click',submit);
 $('form').addEventListener('submit',function(e){ e.preventDefault(); submit(); });
 $('form').addEventListener('input',function(){ S.reqId=null; });
 $('amt').addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); if(S.f.type==='EXP') $('desc').focus(); else $('amt').blur(); } });
-$('prev').addEventListener('click',function(){ S.ym=shiftYm(S.ym,-1); load(); });
-$('next').addEventListener('click',function(){ S.ym=shiftYm(S.ym,1); load(); });
+$('prev').addEventListener('click',function(){ changeMonth(-1); });
+$('next').addEventListener('click',function(){ changeMonth(1); });
 $('backdrop').addEventListener('click',function(){ if(!S.busy) closeSheet(); });
 document.addEventListener('keydown',function(e){ if(e.key==='Escape' && S.sel && !S.busy) closeSheet(); });
 document.addEventListener('visibilitychange',function(){ if(document.visibilityState==='visible' && !S.busy && CONF) load(); });
