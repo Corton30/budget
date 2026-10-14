@@ -1,6 +1,6 @@
 // Garde une copie de l'interface pour qu'elle s'ouvre même sans réseau.
 // Réseau d'abord : une nouvelle version publiée est toujours prise en priorité.
-const CACHE = 'budget-shell-v5';
+const CACHE = 'budget-shell-v6';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-180.png', './icon-192.png'];
 
 self.addEventListener('install', e => {
